@@ -1,6 +1,11 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '../../context/AppContext';
 import { POPULAR_LOCATIONS } from '../../data/mockData';
+import { 
+  searchPlacesPublic, 
+  reverseGeocodePublic
+} from '../../services/mapService';
+import type { GeocodeResult } from '../../services/mapService';
 import { 
   Navigation, 
   MapPin, 
@@ -9,8 +14,8 @@ import {
   SlidersHorizontal, 
   Sparkles, 
   Route, 
-  Clock, 
-  BatteryCharging 
+  Search, 
+  Loader2 
 } from 'lucide-react';
 
 export const RouteSearch: React.FC<{
@@ -25,48 +30,131 @@ export const RouteSearch: React.FC<{
     maxPriceFilter,
     setMaxPriceFilter,
     showOnlyAvailable,
-    setShowOnlyAvailable,
-    stations
+    setShowOnlyAvailable
   } = useApp();
 
   const [locating, setLocating] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
 
-  // Handle "Use My Location" GPS
+  // Autocomplete state for From & To
+  const [fromSuggestions, setFromSuggestions] = useState<GeocodeResult[]>([]);
+  const [toSuggestions, setToSuggestions] = useState<GeocodeResult[]>([]);
+  const [loadingFrom, setLoadingFrom] = useState(false);
+  const [loadingTo, setLoadingTo] = useState(false);
+  const [showFromDropdown, setShowFromDropdown] = useState(false);
+  const [showToDropdown, setShowToDropdown] = useState(false);
+
+  const fromDropdownRef = useRef<HTMLDivElement>(null);
+  const toDropdownRef = useRef<HTMLDivElement>(null);
+
+  // Live Geocoding for "From" Input
+  useEffect(() => {
+    if (!searchRoute.from || searchRoute.from.length < 3 || !showFromDropdown) {
+      setFromSuggestions([]);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      setLoadingFrom(true);
+      const results = await searchPlacesPublic(searchRoute.from);
+      setFromSuggestions(results);
+      setLoadingFrom(false);
+    }, 350);
+
+    return () => clearTimeout(timer);
+  }, [searchRoute.from, showFromDropdown]);
+
+  // Live Geocoding for "To" Input
+  useEffect(() => {
+    if (!searchRoute.to || searchRoute.to.length < 3 || !showToDropdown) {
+      setToSuggestions([]);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      setLoadingTo(true);
+      const results = await searchPlacesPublic(searchRoute.to);
+      setToSuggestions(results);
+      setLoadingTo(false);
+    }, 350);
+
+    return () => clearTimeout(timer);
+  }, [searchRoute.to, showToDropdown]);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (fromDropdownRef.current && !fromDropdownRef.current.contains(e.target as Node)) {
+        setShowFromDropdown(false);
+      }
+      if (toDropdownRef.current && !toDropdownRef.current.contains(e.target as Node)) {
+        setShowToDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Handle "Use My Location" GPS with Public Reverse Geocoding API
   const handleUseMyLocation = () => {
     setLocating(true);
     if ('geolocation' in navigator) {
       navigator.geolocation.getCurrentPosition(
-        (position) => {
+        async (position) => {
+          const lat = position.coords.latitude || 17.4485;
+          const lng = position.coords.longitude || 78.3750;
+          
+          // Get real street address from OpenStreetMap Nominatim
+          const address = await reverseGeocodePublic(lat, lng);
+
           setSearchRoute((prev) => ({
             ...prev,
-            from: 'Current Location (GPS: HITEC City Hub)',
-            fromCoords: {
-              lat: position.coords.latitude || 17.4485,
-              lng: position.coords.longitude || 78.3750,
-            },
+            from: address || 'Current Location (GPS: Cyber Towers)',
+            fromCoords: { lat, lng },
           }));
           setLocating(false);
         },
-        (_error) => {
-          // Fallback location for demo / when GPS blocked
+        async (_error) => {
+          const lat = 17.4485;
+          const lng = 78.3750;
+          const address = await reverseGeocodePublic(lat, lng);
           setSearchRoute((prev) => ({
             ...prev,
-            from: 'Current Location (GPS Live: HITEC City)',
-            fromCoords: { lat: 17.4485, lng: 78.3750 },
+            from: address || 'HITEC City Hub, Hyderabad',
+            fromCoords: { lat, lng },
           }));
           setLocating(false);
         },
-        { timeout: 5000 }
+        { timeout: 6000 }
       );
     } else {
       setSearchRoute((prev) => ({
         ...prev,
-        from: 'Current Location (GPS: HITEC City)',
+        from: 'HITEC City Hub, Hyderabad',
         fromCoords: { lat: 17.4485, lng: 78.3750 },
       }));
       setLocating(false);
     }
+  };
+
+  // Select From Suggestion
+  const handleSelectFrom = (item: GeocodeResult) => {
+    setSearchRoute((prev) => ({
+      ...prev,
+      from: item.shortName,
+      fromCoords: { lat: item.lat, lng: item.lng },
+    }));
+    setShowFromDropdown(false);
+  };
+
+  // Select To Suggestion
+  const handleSelectTo = (item: GeocodeResult) => {
+    setSearchRoute((prev) => ({
+      ...prev,
+      to: item.shortName,
+      toCoords: { lat: item.lat, lng: item.lng },
+    }));
+    setShowToDropdown(false);
   };
 
   // Swap From and Destination
@@ -91,7 +179,7 @@ export const RouteSearch: React.FC<{
   return (
     <div className="w-full space-y-4">
       {/* Route Finder Card */}
-      <div className="glass-panel p-5 sm:p-6 rounded-3xl border border-slate-800 shadow-xl relative overflow-hidden">
+      <div className="glass-panel p-5 sm:p-6 rounded-3xl border border-slate-800 shadow-xl relative">
         {/* Glow accent */}
         <div className="absolute top-0 right-0 w-80 h-80 bg-emerald-500/5 rounded-full blur-3xl pointer-events-none"></div>
 
@@ -99,7 +187,7 @@ export const RouteSearch: React.FC<{
           <div>
             <div className="flex items-center gap-2 text-emerald-400 text-xs font-bold uppercase tracking-wider mb-1">
               <Route className="w-4 h-4" />
-              <span>Smart EV Highway & City Route Discovery</span>
+              <span>Live Public Map & Road Routing Integration</span>
             </div>
             <h2 className="text-xl sm:text-2xl font-black text-white tracking-tight font-['Space_Grotesk']">
               Plan Your EV Journey & Find Live Stations
@@ -138,8 +226,8 @@ export const RouteSearch: React.FC<{
         {/* Search Input Controls */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-center">
           
-          {/* FROM Location */}
-          <div className="lg:col-span-5 relative">
+          {/* FROM Location Input with Live Autocomplete */}
+          <div className="lg:col-span-5 relative" ref={fromDropdownRef}>
             <label className="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between">
               <span className="flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 ring-2 ring-emerald-400/30"></span>
@@ -152,7 +240,7 @@ export const RouteSearch: React.FC<{
                 className="text-emerald-400 hover:text-emerald-300 text-[11px] font-semibold flex items-center gap-1 bg-emerald-500/10 hover:bg-emerald-500/20 px-2 py-0.5 rounded-md border border-emerald-500/20 transition-all"
               >
                 <LocateFixed className={`w-3 h-3 ${locating ? 'animate-spin' : ''}`} />
-                {locating ? 'Locating...' : 'Use My Location'}
+                {locating ? 'Locating...' : 'Use My GPS'}
               </button>
             </label>
             <div className="relative">
@@ -160,11 +248,41 @@ export const RouteSearch: React.FC<{
               <input
                 type="text"
                 value={searchRoute.from}
-                onChange={(e) => setSearchRoute((prev) => ({ ...prev, from: e.target.value }))}
-                placeholder="Enter starting point or click 'Use My Location'"
-                className="w-full pl-10 pr-4 py-3 bg-slate-800/80 border border-slate-700/80 rounded-2xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
+                onFocus={() => setShowFromDropdown(true)}
+                onChange={(e) => {
+                  setSearchRoute((prev) => ({ ...prev, from: e.target.value }));
+                  setShowFromDropdown(true);
+                }}
+                placeholder="Search city, area, or address (e.g. Gachibowli, Banjara Hills)"
+                className="w-full pl-10 pr-9 py-3 bg-slate-800/80 border border-slate-700/80 rounded-2xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
               />
+              {loadingFrom && (
+                <Loader2 className="absolute right-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-emerald-400 animate-spin" />
+              )}
             </div>
+
+            {/* From Location Suggestions Dropdown */}
+            {showFromDropdown && fromSuggestions.length > 0 && (
+              <div className="absolute top-full left-0 right-0 mt-1 z-50 bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden animate-in fade-in duration-150">
+                <div className="p-2 border-b border-slate-800 text-[10px] uppercase font-bold text-slate-400 flex items-center gap-1">
+                  <Search className="w-3 h-3 text-emerald-400" /> Public Map Suggestions
+                </div>
+                {fromSuggestions.map((item, idx) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => handleSelectFrom(item)}
+                    className="w-full px-3.5 py-2.5 text-left hover:bg-slate-800/80 transition-colors flex items-start gap-2.5 border-b border-slate-800/50 last:border-0"
+                  >
+                    <MapPin className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+                    <div>
+                      <div className="text-xs font-bold text-white">{item.shortName}</div>
+                      <div className="text-[10px] text-slate-400 truncate max-w-sm">{item.name}</div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Swap Button */}
@@ -179,22 +297,52 @@ export const RouteSearch: React.FC<{
             </button>
           </div>
 
-          {/* DESTINATION Location */}
-          <div className="lg:col-span-6 relative">
+          {/* DESTINATION Location Input with Live Autocomplete */}
+          <div className="lg:col-span-6 relative" ref={toDropdownRef}>
             <label className="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1 flex items-center gap-1.5">
               <span className="w-2 h-2 rounded-full bg-cyan-400 ring-2 ring-cyan-400/30"></span>
-              Destination (Trip End)
+              Destination (Trip End / Station)
             </label>
             <div className="relative">
               <Navigation className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-cyan-400" />
               <input
                 type="text"
                 value={searchRoute.to}
-                onChange={(e) => setSearchRoute((prev) => ({ ...prev, to: e.target.value }))}
-                placeholder="e.g. Rajiv Gandhi International Airport or Gachibowli"
-                className="w-full pl-10 pr-4 py-3 bg-slate-800/80 border border-slate-700/80 rounded-2xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500"
+                onFocus={() => setShowToDropdown(true)}
+                onChange={(e) => {
+                  setSearchRoute((prev) => ({ ...prev, to: e.target.value }));
+                  setShowToDropdown(true);
+                }}
+                placeholder="Search destination, airport, mall (e.g. RGIA Airport, Madhapur)"
+                className="w-full pl-10 pr-9 py-3 bg-slate-800/80 border border-slate-700/80 rounded-2xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500"
               />
+              {loadingTo && (
+                <Loader2 className="absolute right-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-cyan-400 animate-spin" />
+              )}
             </div>
+
+            {/* To Location Suggestions Dropdown */}
+            {showToDropdown && toSuggestions.length > 0 && (
+              <div className="absolute top-full left-0 right-0 mt-1 z-50 bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden animate-in fade-in duration-150">
+                <div className="p-2 border-b border-slate-800 text-[10px] uppercase font-bold text-slate-400 flex items-center gap-1">
+                  <Search className="w-3 h-3 text-cyan-400" /> Public Map Suggestions
+                </div>
+                {toSuggestions.map((item, idx) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => handleSelectTo(item)}
+                    className="w-full px-3.5 py-2.5 text-left hover:bg-slate-800/80 transition-colors flex items-start gap-2.5 border-b border-slate-800/50 last:border-0"
+                  >
+                    <Navigation className="w-3.5 h-3.5 text-cyan-400 mt-0.5 shrink-0" />
+                    <div>
+                      <div className="text-xs font-bold text-white">{item.shortName}</div>
+                      <div className="text-[10px] text-slate-400 truncate max-w-sm">{item.name}</div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 
@@ -256,7 +404,7 @@ export const RouteSearch: React.FC<{
                 </div>
                 <input
                   type="range"
-                  min="10"
+                  min="1"
                   max="30"
                   step="1"
                   value={maxPriceFilter}
@@ -282,41 +430,6 @@ export const RouteSearch: React.FC<{
             </div>
           </div>
         )}
-
-        {/* Route Live Metrics Bar */}
-        <div className="mt-4 grid grid-cols-3 gap-2 sm:gap-4 bg-slate-900/60 p-3 rounded-2xl border border-slate-800/80">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0">
-              <Route className="w-4 h-4 text-emerald-400" />
-            </div>
-            <div>
-              <div className="text-[10px] text-slate-400 font-medium">Route Distance</div>
-              <div className="text-sm font-bold text-white">31.8 km</div>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center shrink-0">
-              <Clock className="w-4 h-4 text-cyan-400" />
-            </div>
-            <div>
-              <div className="text-[10px] text-slate-400 font-medium">Drive ETA</div>
-              <div className="text-sm font-bold text-white">~38 Mins</div>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center shrink-0">
-              <BatteryCharging className="w-4 h-4 text-purple-400" />
-            </div>
-            <div>
-              <div className="text-[10px] text-slate-400 font-medium">Stations On Route</div>
-              <div className="text-sm font-bold text-emerald-400">
-                {stations.length} Active Hubs
-              </div>
-            </div>
-          </div>
-        </div>
 
       </div>
     </div>

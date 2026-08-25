@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
 import type { Station } from '../../types';
+import { fetchRealRoadRoute } from '../../services/mapService';
+import type { RealRouteResult } from '../../services/mapService';
 import L from 'leaflet';
 import { 
   Navigation, 
@@ -21,24 +23,6 @@ import {
   Clock,
   Sparkles
 } from 'lucide-react';
-
-// Haversine formula to compute realistic road distance between From Location and Charging Station
-function calculateRoadDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371; // Earth radius in km
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  const straightKm = R * c;
-  // Account for Indian urban highway & city road curvature multiplier (~1.35x)
-  const roadKm = Math.max(1.5, Math.round(straightKm * 1.35 * 10) / 10);
-  return roadKm;
-}
 
 export const MapView: React.FC<{
   selectedStation?: Station | null;
@@ -61,44 +45,67 @@ export const MapView: React.FC<{
   const [currentSpeed, setCurrentSpeed] = useState(48); // km/h
   const [hasArrived, setHasArrived] = useState(false);
 
+  // Real Route Data from Public OSRM API
+  const [realRouteData, setRealRouteData] = useState<RealRouteResult | null>(null);
+  const [loadingRoute, setLoadingRoute] = useState(false);
+
   // Waypoints for the route
   const fromLat = searchRoute.fromCoords?.lat || 17.4504;
   const fromLng = searchRoute.fromCoords?.lng || 78.3808;
   const toLat = searchRoute.toCoords?.lat || (selectedStation ? selectedStation.lat : 17.2403);
   const toLng = searchRoute.toCoords?.lng || (selectedStation ? selectedStation.lng : 78.4294);
 
-  // Dynamically calculate actual driving distance between From Location and Destination
-  const totalDrivingDistanceKm = useMemo(() => {
-    return calculateRoadDistance(fromLat, fromLng, toLat, toLng);
+  // Fetch real road route from OSRM Public Routing API
+  useEffect(() => {
+    let isMounted = true;
+    async function loadRoute() {
+      setLoadingRoute(true);
+      const result = await fetchRealRoadRoute(
+        { lat: fromLat, lng: fromLng },
+        { lat: toLat, lng: toLng }
+      );
+      if (isMounted) {
+        setRealRouteData(result);
+        setLoadingRoute(false);
+      }
+    }
+    loadRoute();
+    return () => {
+      isMounted = false;
+    };
   }, [fromLat, fromLng, toLat, toLng]);
 
-  // Transport details configuration dynamically based on distance
+  // Actual driving distance and duration from real public road routing API
+  const actualDistanceKm = realRouteData?.distanceKm || 31.8;
+  const actualDurationMins = realRouteData?.durationMins || 38;
+
+  // Transport details configuration dynamically based on real road distance
   const transportConfigs = useMemo(() => ({
     car: { 
       label: 'Car / 4W EV', 
-      baseDistance: totalDrivingDistanceKm, 
-      baseMins: Math.max(5, Math.round((totalDrivingDistanceKm / 48) * 60)), 
+      baseDistance: actualDistanceKm, 
+      baseMins: actualDurationMins, 
       baseSpeed: 52, 
       icon: Car, 
-      batteryDrain: Math.max(4, Math.round(totalDrivingDistanceKm * 0.55)) 
+      batteryDrain: Math.max(4, Math.round(actualDistanceKm * 0.55)) 
     },
     bike: { 
       label: '2W Scooter EV', 
-      baseDistance: Math.max(1.2, Math.round(totalDrivingDistanceKm * 0.95 * 10) / 10), 
-      baseMins: Math.max(6, Math.round((totalDrivingDistanceKm / 36) * 60)), 
+      baseDistance: Math.max(1.2, Math.round(actualDistanceKm * 0.95 * 10) / 10), 
+      baseMins: Math.max(6, Math.round(actualDurationMins * 1.15)), 
       baseSpeed: 38, 
       icon: Bike, 
-      batteryDrain: Math.max(6, Math.round(totalDrivingDistanceKm * 0.75)) 
+      batteryDrain: Math.max(6, Math.round(actualDistanceKm * 0.75)) 
     },
     bus: { 
       label: 'Bus / Fleet EV', 
-      baseDistance: Math.max(1.8, Math.round(totalDrivingDistanceKm * 1.05 * 10) / 10), 
-      baseMins: Math.max(8, Math.round((totalDrivingDistanceKm / 34) * 60)), 
+      baseDistance: Math.max(1.8, Math.round(actualDistanceKm * 1.05 * 10) / 10), 
+      baseMins: Math.max(8, Math.round(actualDurationMins * 1.3)), 
       baseSpeed: 40, 
       icon: Bus, 
-      batteryDrain: Math.max(8, Math.round(totalDrivingDistanceKm * 0.9)) 
+      batteryDrain: Math.max(8, Math.round(actualDistanceKm * 0.9)) 
     },
-  }), [totalDrivingDistanceKm]);
+  }), [actualDistanceKm, actualDurationMins]);
 
   const currentConfig = transportConfigs[transportMode];
 
@@ -107,31 +114,29 @@ export const MapView: React.FC<{
   const timeRemainingMins = Math.max(0, Math.ceil(currentConfig.baseMins * (1 - progressPercent / 100)));
   const estimatedArrivalBattery = Math.max(15, 85 - Math.round(currentConfig.batteryDrain * (progressPercent / 100)));
 
-  // Intermediate route coordinates polyline
+  // Route coordinates polyline from public routing API
   const routePoints: [number, number][] = useMemo(() => {
-    const midLat1 = fromLat + (toLat - fromLat) * 0.33 + 0.003;
-    const midLng1 = fromLng + (toLng - fromLng) * 0.33 - 0.002;
-    const midLat2 = fromLat + (toLat - fromLat) * 0.66 - 0.002;
-    const midLng2 = fromLng + (toLng - fromLng) * 0.66 + 0.003;
+    if (realRouteData && realRouteData.coordinates.length > 0) {
+      return realRouteData.coordinates;
+    }
     return [
       [fromLat, fromLng],
-      [midLat1, midLng1],
-      [midLat2, midLng2],
       [toLat, toLng]
     ];
-  }, [fromLat, fromLng, toLat, toLng]);
+  }, [realRouteData, fromLat, fromLng, toLat, toLng]);
 
-  // Turn by turn instructions based on progress
-  const getTurnInstruction = (pct: number) => {
-    if (pct < 15) return { text: `Depart from ${searchRoute.from.split(' ')[0]} via Main Corridor`, dist: '350m' };
-    if (pct < 35) return { text: 'In 600m, Turn Right onto Main Expressway', dist: '600m' };
-    if (pct < 60) return { text: 'Merge onto Outer Ring Road (ORR) Toll-way', dist: '2.4 km' };
-    if (pct < 85) return { text: `Continue straight for ${(distanceRemaining * 0.7).toFixed(1)} km`, dist: `${(distanceRemaining * 0.7).toFixed(1)} km` };
-    if (pct < 98) return { text: `In 300m, Exit towards ${searchRoute.to.split(' ')[0]}`, dist: '300m' };
-    return { text: 'You have arrived at your destination!', dist: '0m' };
-  };
-
-  const currentInstruction = getTurnInstruction(progressPercent);
+  // Turn by turn instructions from real API steps
+  const currentInstruction = useMemo(() => {
+    if (!realRouteData || !realRouteData.instructions || realRouteData.instructions.length === 0) {
+      return { text: `Head towards ${searchRoute.to}`, dist: `${distanceRemaining} km` };
+    }
+    const totalSteps = realRouteData.instructions.length;
+    const stepIdx = Math.min(totalSteps - 1, Math.floor((progressPercent / 100) * totalSteps));
+    return {
+      text: realRouteData.instructions[stepIdx].text,
+      dist: realRouteData.instructions[stepIdx].distance || `${distanceRemaining} km`
+    };
+  }, [realRouteData, progressPercent, searchRoute.to, distanceRemaining]);
 
   // Real-time GPS Vehicle Cursor Animation Simulation
   useEffect(() => {
@@ -220,6 +225,7 @@ export const MapView: React.FC<{
 
       L.control.zoom({ position: 'bottomright' }).addTo(map);
 
+      // OpenStreetMap Public Tile Layer
       L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
         attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
         maxZoom: 19,
@@ -246,7 +252,7 @@ export const MapView: React.FC<{
       className: 'custom-map-icon',
       html: `
         <div style="background-color: #10b981; color: black; font-weight: 800; font-size: 11px; padding: 4px 8px; border-radius: 9999px; border: 2px solid white; box-shadow: 0 4px 12px rgba(0,0,0,0.5); display: flex; align-items: center; gap: 4px; white-space: nowrap;">
-          <span>📍 START: ${searchRoute.from.split(' ')[0]}</span>
+          <span>📍 FROM: ${searchRoute.from.split(',')[0]}</span>
         </div>
       `,
       iconSize: [110, 30],
@@ -265,7 +271,7 @@ export const MapView: React.FC<{
       className: 'custom-map-icon',
       html: `
         <div style="background-color: #06b6d4; color: black; font-weight: 800; font-size: 11px; padding: 4px 8px; border-radius: 9999px; border: 2px solid white; box-shadow: 0 4px 12px rgba(0,0,0,0.5); display: flex; align-items: center; gap: 4px; white-space: nowrap;">
-          <span>🏁 DESTINATION: ${searchRoute.to.split(' ')[0]}</span>
+          <span>🏁 DESTINATION: ${searchRoute.to.split(',')[0]}</span>
         </div>
       `,
       iconSize: [120, 30],
@@ -276,7 +282,7 @@ export const MapView: React.FC<{
       .addTo(markersGroup)
       .bindPopup(`<b>Destination:</b><br>${searchRoute.to}`);
 
-    // 3. Draw Route Polyline
+    // 3. Draw Real Road Polyline from Public Routing API
     L.polyline(routePoints, {
       color: '#10b981',
       weight: 6,
@@ -406,7 +412,7 @@ export const MapView: React.FC<{
                 <div className="text-[11px] font-black uppercase tracking-wider text-black/75">
                   {currentInstruction.dist}
                 </div>
-                <div className="text-sm font-extrabold leading-tight text-black">
+                <div className="text-sm font-extrabold leading-tight text-black truncate max-w-xs sm:max-w-md">
                   {currentInstruction.text}
                 </div>
               </div>
@@ -441,14 +447,16 @@ export const MapView: React.FC<{
           </div>
         )}
 
-        {/* Non-navigating Header: Transport Mode Selector & GPS Grid Indicator */}
+        {/* Non-navigating Header: Transport Mode Selector & Live Public Routing Status */}
         {!isNavigating && (
           <div className="pointer-events-auto flex items-center justify-between gap-2 flex-wrap bg-slate-900/90 backdrop-blur-md p-2 rounded-2xl border border-slate-700/80 shadow-lg text-xs">
             
             {/* Live EV Grid Status */}
             <div className="flex items-center gap-2 px-2 py-1 font-bold text-white">
               <Compass className="w-4 h-4 text-emerald-400 animate-spin-slow" />
-              <span className="hidden sm:inline">Live EV Navigation Map</span>
+              <span className="hidden sm:inline">
+                {loadingRoute ? 'Calculating Real Route...' : 'Public Road Route (OSRM)'}
+              </span>
             </div>
 
             {/* Transport Mode Switcher Chips with dynamic travel times */}
@@ -498,7 +506,7 @@ export const MapView: React.FC<{
       {/* ======================================================== */}
       <div className="p-4 bg-slate-900/95 border-t border-slate-800 z-[400] space-y-3">
         
-        {/* Real-time Distance, ETA, Battery & Speed Metrics */}
+        {/* Real-time Distance, ETA, Battery & Speed Metrics from Public API */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
           
           {/* 1. Real-time ETA */}
@@ -514,7 +522,7 @@ export const MapView: React.FC<{
           <div className="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center gap-2.5">
             <MapPin className="w-4 h-4 text-cyan-400 shrink-0" />
             <div>
-              <div className="text-[10px] text-slate-400 uppercase font-bold">Distance Remaining</div>
+              <div className="text-[10px] text-slate-400 uppercase font-bold">Real Road Distance</div>
               <div className="text-sm font-black text-cyan-300 font-mono">{distanceRemaining} KM</div>
             </div>
           </div>

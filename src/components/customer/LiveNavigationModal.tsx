@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
+import { fetchRealRoadRoute } from '../../services/mapService';
+import type { RealRouteResult } from '../../services/mapService';
 import L from 'leaflet';
 import confetti from 'canvas-confetti';
 import { 
@@ -22,24 +24,6 @@ import {
   Zap,
   ArrowRight
 } from 'lucide-react';
-
-// Haversine formula to compute realistic road distance between From Location and Charging Station
-function calculateRoadDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371; // Earth radius in km
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  const straightKm = R * c;
-  // Account for Indian urban highway & city road curvature multiplier (~1.35x)
-  const roadKm = Math.max(1.5, Math.round(straightKm * 1.35 * 10) / 10);
-  return roadKm;
-}
 
 export const LiveNavigationModal: React.FC = () => {
   const { 
@@ -64,6 +48,9 @@ export const LiveNavigationModal: React.FC = () => {
   const [currentSpeed, setCurrentSpeed] = useState(52);
   const [hasArrived, setHasArrived] = useState(false);
 
+  // Real OSRM Public Routing Data
+  const [realRouteData, setRealRouteData] = useState<RealRouteResult | null>(null);
+
   // Destination coordinates (Charging Station)
   const destLat = navigatingTarget?.lat || searchRoute.toCoords?.lat || 17.4504;
   const destLng = navigatingTarget?.lng || searchRoute.toCoords?.lng || 78.3808;
@@ -75,17 +62,35 @@ export const LiveNavigationModal: React.FC = () => {
   const fromLng = searchRoute.fromCoords?.lng || 78.3680;
   const fromName = searchRoute.from || 'Current Location';
 
-  // Calculate actual driving distance dynamically between From Location and Charging Station
-  const totalDrivingDistanceKm = useMemo(() => {
-    return calculateRoadDistance(fromLat, fromLng, destLat, destLng);
-  }, [fromLat, fromLng, destLat, destLng]);
+  // Fetch real road route from Public Routing API when modal opens or coordinates change
+  useEffect(() => {
+    if (!liveNavigationModalOpen) return;
+    let isMounted = true;
+    async function loadRoute() {
+      const result = await fetchRealRoadRoute(
+        { lat: fromLat, lng: fromLng },
+        { lat: destLat, lng: destLng }
+      );
+      if (isMounted) {
+        setRealRouteData(result);
+      }
+    }
+    loadRoute();
+    return () => {
+      isMounted = false;
+    };
+  }, [liveNavigationModalOpen, fromLat, fromLng, destLat, destLng]);
+
+  // Actual driving distance and duration from real public road routing API
+  const totalDrivingDistanceKm = realRouteData?.distanceKm || 28.5;
+  const actualDurationMins = realRouteData?.durationMins || 34;
 
   // Transport details configured based on actual road distance
   const transportConfigs = useMemo(() => ({
     car: { 
       label: 'Car / 4W EV', 
       baseDistance: totalDrivingDistanceKm, 
-      baseMins: Math.max(5, Math.round((totalDrivingDistanceKm / 48) * 60)), 
+      baseMins: actualDurationMins, 
       baseSpeed: 52, 
       icon: Car, 
       batteryDrain: Math.max(4, Math.round(totalDrivingDistanceKm * 0.55)) 
@@ -93,7 +98,7 @@ export const LiveNavigationModal: React.FC = () => {
     bike: { 
       label: '2W Scooter EV', 
       baseDistance: Math.max(1.2, Math.round(totalDrivingDistanceKm * 0.95 * 10) / 10), 
-      baseMins: Math.max(6, Math.round((totalDrivingDistanceKm / 36) * 60)), 
+      baseMins: Math.max(6, Math.round(actualDurationMins * 1.15)), 
       baseSpeed: 38, 
       icon: Bike, 
       batteryDrain: Math.max(6, Math.round(totalDrivingDistanceKm * 0.75)) 
@@ -101,12 +106,12 @@ export const LiveNavigationModal: React.FC = () => {
     bus: { 
       label: 'Bus / Fleet EV', 
       baseDistance: Math.max(1.8, Math.round(totalDrivingDistanceKm * 1.05 * 10) / 10), 
-      baseMins: Math.max(8, Math.round((totalDrivingDistanceKm / 34) * 60)), 
+      baseMins: Math.max(8, Math.round(actualDurationMins * 1.3)), 
       baseSpeed: 40, 
       icon: Bus, 
       batteryDrain: Math.max(8, Math.round(totalDrivingDistanceKm * 0.9)) 
     },
-  }), [totalDrivingDistanceKm]);
+  }), [totalDrivingDistanceKm, actualDurationMins]);
 
   const currentConfig = transportConfigs[transportMode];
 
@@ -115,30 +120,29 @@ export const LiveNavigationModal: React.FC = () => {
   const timeRemainingMins = Math.max(0, Math.ceil(currentConfig.baseMins * (1 - progressPercent / 100)));
   const estimatedArrivalBattery = Math.max(10, 88 - Math.round(currentConfig.batteryDrain * (progressPercent / 100)));
 
-  // Intermediate route points for smooth animation
+  // Real road coordinates polyline from public routing API
   const routePoints: [number, number][] = useMemo(() => {
-    const midLat1 = fromLat + (destLat - fromLat) * 0.33 + 0.003;
-    const midLng1 = fromLng + (destLng - fromLng) * 0.33 - 0.002;
-    const midLat2 = fromLat + (destLat - fromLat) * 0.66 - 0.002;
-    const midLng2 = fromLng + (destLng - fromLng) * 0.66 + 0.003;
+    if (realRouteData && realRouteData.coordinates.length > 0) {
+      return realRouteData.coordinates;
+    }
     return [
       [fromLat, fromLng],
-      [midLat1, midLng1],
-      [midLat2, midLng2],
       [destLat, destLng]
     ];
-  }, [fromLat, fromLng, destLat, destLng]);
+  }, [realRouteData, fromLat, fromLng, destLat, destLng]);
 
-  // Turn-by-turn instruction steps
-  const getTurnInstruction = (pct: number) => {
-    if (pct < 20) return { text: `Depart from ${fromName.split('(')[0]} towards ${destName.split('-')[0]}`, dist: '400m', turn: 'straight' };
-    if (pct < 50) return { text: 'In 600m, Turn Right onto Main EV Highway Corridor', dist: '600m', turn: 'right' };
-    if (pct < 85) return { text: `Continue straight on expressway for ${(distanceRemaining * 0.7).toFixed(1)} km`, dist: `${(distanceRemaining * 0.7).toFixed(1)} km`, turn: 'straight' };
-    if (pct < 98) return { text: `In 200m, Charging Station ${destName.split('-')[0]} is on your left`, dist: '200m', turn: 'left' };
-    return { text: `You have arrived at ${destName}! Plug in to charge.`, dist: '0m', turn: 'arrived' };
-  };
-
-  const currentInstruction = getTurnInstruction(progressPercent);
+  // Turn-by-turn instruction steps from real public API
+  const currentInstruction = useMemo(() => {
+    if (!realRouteData || !realRouteData.instructions || realRouteData.instructions.length === 0) {
+      return { text: `Depart from ${fromName.split(',')[0]} towards ${destName.split('-')[0]}`, dist: '400m' };
+    }
+    const totalSteps = realRouteData.instructions.length;
+    const stepIdx = Math.min(totalSteps - 1, Math.floor((progressPercent / 100) * totalSteps));
+    return {
+      text: realRouteData.instructions[stepIdx].text,
+      dist: realRouteData.instructions[stepIdx].distance || `${distanceRemaining} km`
+    };
+  }, [realRouteData, progressPercent, fromName, destName, distanceRemaining]);
 
   // Position interpolation along route points
   const calculateCurrentPosition = (pct: number): [number, number] => {
@@ -177,7 +181,7 @@ export const LiveNavigationModal: React.FC = () => {
         const jitter = Math.floor(currentConfig.baseSpeed + (Math.random() * 8 - 4));
         setCurrentSpeed(jitter);
 
-        return Math.min(100, prev + 1.5);
+        return Math.min(100, prev + 1.2);
       });
     }, 350);
 
@@ -259,7 +263,7 @@ export const LiveNavigationModal: React.FC = () => {
         className: 'custom-map-icon',
         html: `
           <div style="background-color: #10b981; color: black; font-weight: 800; font-size: 11px; padding: 4px 8px; border-radius: 9999px; border: 2px solid white; box-shadow: 0 4px 12px rgba(0,0,0,0.5); display: flex; align-items: center; gap: 4px; white-space: nowrap;">
-            <span>📍 FROM: ${fromName.split(' ')[0]}</span>
+            <span>📍 FROM: ${fromName.split(',')[0]}</span>
           </div>
         `,
         iconSize: [110, 30],
@@ -276,7 +280,7 @@ export const LiveNavigationModal: React.FC = () => {
         className: 'custom-map-icon',
         html: `
           <div style="background-color: #06b6d4; color: black; font-weight: 800; font-size: 11px; padding: 4px 8px; border-radius: 9999px; border: 2px solid white; box-shadow: 0 4px 12px rgba(0,0,0,0.5); display: flex; align-items: center; gap: 4px; white-space: nowrap;">
-            <span>⚡ STATION: ${destName.split(' ')[0]}</span>
+            <span>⚡ STATION: ${destName.split('-')[0]}</span>
           </div>
         `,
         iconSize: [130, 30],
@@ -285,7 +289,7 @@ export const LiveNavigationModal: React.FC = () => {
 
       L.marker(toLatLng, { icon: destIcon }).addTo(markersGroup);
 
-      // Route Polyline connecting From Location to Charging Station
+      // Real Road Polyline from Public Routing API
       L.polyline(routePoints, {
         color: '#10b981',
         weight: 6,
@@ -341,16 +345,8 @@ export const LiveNavigationModal: React.FC = () => {
 
   // Launch Google Maps App with exact "From Location" to "Charging Station" navigation
   const handleOpenGoogleMapsApp = () => {
-    // 1. Precise Origin (From Location)
-    let originQuery = `${fromLat},${fromLng}`;
-    if (searchRoute.from && searchRoute.from.trim()) {
-      originQuery = `${fromLat},${fromLng}`;
-    }
-
-    // 2. Precise Destination (Charging Station)
+    const originQuery = `${fromLat},${fromLng}`;
     const destQuery = `${destLat},${destLng}`;
-
-    // 3. Google Maps directions URL with from $\rightarrow$ to route and travel time calculation
     const gmapsUrl = `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(originQuery)}&destination=${encodeURIComponent(destQuery)}&travelmode=driving`;
     window.open(gmapsUrl, '_blank');
   };
@@ -420,7 +416,7 @@ export const LiveNavigationModal: React.FC = () => {
                   <div className="text-[11px] font-black uppercase tracking-wider text-black/75">
                     {currentInstruction.dist}
                   </div>
-                  <div className="text-sm font-extrabold leading-tight text-black">
+                  <div className="text-sm font-extrabold leading-tight text-black truncate max-w-xs sm:max-w-md">
                     {currentInstruction.text}
                   </div>
                 </div>
@@ -487,7 +483,7 @@ export const LiveNavigationModal: React.FC = () => {
         {/* ======================================================== */}
         <div className="p-4 sm:p-5 bg-slate-950 border-t border-slate-800 space-y-3 z-10">
           
-          {/* Dynamic Metrics Row: Distance, Travel Time, GPS Speed, Battery */}
+          {/* Dynamic Metrics Row: Real Road Distance, Travel Time, GPS Speed, Battery */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
             
             {/* 1. Travel Time */}
@@ -503,7 +499,7 @@ export const LiveNavigationModal: React.FC = () => {
             <div className="p-2.5 rounded-2xl bg-slate-900/90 border border-slate-800 flex items-center gap-2.5">
               <MapPin className="w-4 h-4 text-cyan-400 shrink-0" />
               <div>
-                <div className="text-[10px] text-slate-400 uppercase font-bold">Journey Distance</div>
+                <div className="text-[10px] text-slate-400 uppercase font-bold">Real Road Distance</div>
                 <div className="text-sm font-black text-cyan-300 font-mono">{distanceRemaining} KM</div>
               </div>
             </div>
